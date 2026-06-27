@@ -18,8 +18,9 @@ _DEMO_MODE = False
 
 def _init_firebase():
     global _db, _DEMO_MODE
+    cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
     cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
-    if not cred_path or not os.path.exists(cred_path):
+    if not cred_json and (not cred_path or not os.path.exists(cred_path)):
         print("[WARN] Firebase credentials not found — running in DEMO MODE (in-memory store)")
         _DEMO_MODE = True
         return
@@ -27,8 +28,14 @@ def _init_firebase():
     try:
         import firebase_admin
         from firebase_admin import credentials, firestore
+        import json
+        
         if not firebase_admin._apps:
-            cred = credentials.Certificate(cred_path)
+            if cred_json:
+                cred_dict = json.loads(cred_json)
+                cred = credentials.Certificate(cred_dict)
+            else:
+                cred = credentials.Certificate(cred_path)
             firebase_admin.initialize_app(cred)
         _db = firestore.client()
         print("[OK] Firebase connected")

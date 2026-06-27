@@ -24,7 +24,6 @@ export const db   = getFirestore(app)
 
 export const googleProvider = new GoogleAuthProvider()
 googleProvider.setCustomParameters({ prompt: 'select_account' })
-googleProvider.addScope('https://www.googleapis.com/auth/calendar.readonly')
 
 export const signInWithGoogle = async () => {
   const result = await signInWithPopup(auth, googleProvider)

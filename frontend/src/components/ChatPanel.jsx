@@ -74,14 +74,21 @@ export default function ChatPanel({ onAlerts }) {
     }
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
     const recognition = new SR()
-    recognition.lang = 'en-IN'
-    recognition.interimResults = false
+    recognition.lang = window.navigator.language || 'en-US'
+    recognition.continuous = true
+    recognition.interimResults = true
+    
     recognition.onresult = (e) => {
-      const transcript = e.results[0][0].transcript
-      setInput(transcript)
+      let currentTranscript = ''
+      for (let i = 0; i < e.results.length; i++) {
+        currentTranscript += e.results[i][0].transcript
+      }
+      setInput(currentTranscript)
+    }
+    recognition.onerror = (err) => {
+      console.error("Speech recognition error:", err)
       setListening(false)
     }
-    recognition.onerror = () => setListening(false)
     recognition.onend   = () => setListening(false)
     recognition.start()
     recognitionRef.current = recognition

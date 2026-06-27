@@ -201,6 +201,7 @@ export default function Dashboard() {
               <img
                 src={user.photoURL}
                 alt={user.displayName}
+                referrerPolicy="no-referrer"
                 className="w-7 h-7 rounded-full border border-border-default"
               />
             )}

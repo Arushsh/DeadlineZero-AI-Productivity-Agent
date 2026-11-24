@@ -1,16 +1,6 @@
-"""
-DeadlineZero Agent Service
-Gemini 2.5 Flash with autonomous function calling (google-genai SDK).
-
-Resilience strategy:
-  1. Try primary model (gemini-2.5-flash) first.
-  2. On failure, wait briefly and try fallback models.
-  3. On rate-limit (429), back off for a few seconds before retrying.
-  4. If ALL models fail, return a graceful degraded response instead of crashing.
-"""
+"""DeadlineZero task planner using Gemini function calling."""
 
 import asyncio
-import json
 import uuid
 import os
 import urllib.parse
@@ -23,20 +13,11 @@ from google.genai.errors import ClientError
 
 from models.task import (
     AgentRequest, AgentResponse, Task, Subtask,
-    Priority, TaskStatus
 )
 from tools.agent_tools import AGENT_TOOLS
 
 
-# ── Model fallback chain ─────────────────────────────────────────────────────
-# Ordered from best to most widely available. We'll try each in sequence.
-MODEL_CHAIN = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.0-pro",
-]
+DEFAULT_MODEL = "gemini-flash-latest"
 
 # How long (seconds) to wait before retrying a rate-limited model
 RATE_LIMIT_BACKOFF = 2
@@ -117,9 +98,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%A, %d %B %Y %H:%M UTC")
 
 
-# ── Graceful degraded response (used when all models are unavailable) ────────
+# ── Graceful degraded response ────────
 
-def _degraded_response(request: AgentRequest) -> AgentResponse:
+def _degraded_response(request: AgentRequest, reason: str) -> AgentResponse:
     """
     Returns a helpful offline response so the app never shows a white screen
     even when Gemini is rate-limited or unreachable.
@@ -129,9 +110,9 @@ def _degraded_response(request: AgentRequest) -> AgentResponse:
     critical = [t for t in pending if getattr(t, "priority", "") == "critical"]
 
     lines = [
-        "I'm temporarily offline (Gemini rate limit or service hiccup).",
+        reason,
         "",
-        f"Quick task summary from your data:",
+        "Quick task summary from your data:",
         f"  - Total tasks: {task_count}",
         f"  - Pending: {len(pending)}",
         f"  - Critical: {len(critical)}",
@@ -144,15 +125,9 @@ def _degraded_response(request: AgentRequest) -> AgentResponse:
             dl = f" — due {t.deadline}" if getattr(t, "deadline", None) else ""
             lines.append(f"  * {t.title}{dl}")
 
-    lines += [
-        "",
-        "The AI features will resume automatically once the API is available again.",
-        "Your tasks are safe and all manual features still work normally.",
-    ]
-
     return AgentResponse(
         message="\n".join(lines),
-        alerts=["[WARN] AI agent temporarily offline — Gemini rate limit. Manual task management still works."] if critical else [],
+        alerts=[reason] if critical else [],
         updated_tasks=[],
         actions_taken=[],
     )
@@ -167,8 +142,7 @@ class AgentService:
             raise ValueError("GEMINI_API_KEY not set in environment")
         self.client = genai.Client(api_key=api_key)
         self.tool = _build_tool()
-        # The working model will be discovered at first call and cached
-        self._working_model: str | None = None
+        self.model = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
         print("[OK] Gemini agent ready (google-genai SDK)")
 
     def _tasks_context(self, tasks: list[Task]) -> str:
@@ -310,8 +284,6 @@ class AgentService:
                         print(f"[WARN] Model {model} rate-limited (429), backing off {RATE_LIMIT_BACKOFF}s...")
                         await asyncio.sleep(RATE_LIMIT_BACKOFF)
                         continue
-                raise   # non-recoverable error — let caller try next model
-            except Exception:
                 raise
 
     async def run(self, request: AgentRequest) -> AgentResponse:
@@ -334,39 +306,21 @@ class AgentService:
             temperature=0.3,
         )
 
-        # Build the model list: try the last-known-working model first
-        models_to_try = list(dict.fromkeys(
-            ([self._working_model] if self._working_model else []) + MODEL_CHAIN
-        ))
+        for _ in range(6):
+            try:
+                gemini_resp = await self._call_model(self.model, contents, config)
+            except Exception as error:
+                code = getattr(error, "code", None)
+                print(f"[WARN] Gemini model {self.model}: {type(error).__name__} ({code})")
+                reason = {
+                    404: "The configured Gemini model is unavailable for this project.",
+                    429: "Gemini has reached its request or quota limit.",
+                    403: "Gemini denied this project's request.",
+                }.get(code, "The planning assistant could not reach Gemini or complete the request.")
+                return _degraded_response(request, reason)
 
-        # Agentic loop — keep processing function calls until text response
-        max_turns = 6
-        for turn in range(max_turns):
-            gemini_resp = None
-            last_error = None
-
-            for model in models_to_try:
-                try:
-                    gemini_resp = await self._call_model(model, contents, config)
-                    # Cache the working model for subsequent calls this session
-                    if self._working_model != model:
-                        print(f"[OK] Using model: {model}")
-                        self._working_model = model
-                    break
-                except Exception as e:
-                    last_error = e
-                    print(f"[WARN] Model {model} failed: {type(e).__name__}: {str(e)[:120]}")
-                    continue
-
-            if gemini_resp is None:
-                # All models failed — return graceful degraded response
-                print(f"[WARN] All models unavailable. Returning degraded response. Last error: {last_error}")
-                return _degraded_response(request)
-
-            # Guard: make sure we have candidates
             if not gemini_resp.candidates:
-                print("[WARN] Empty candidates list from Gemini — returning degraded response.")
-                return _degraded_response(request)
+                return _degraded_response(request, "Gemini returned no answer. Try rephrasing your request.")
 
             candidate = gemini_resp.candidates[0]
 
@@ -388,7 +342,7 @@ class AgentService:
                 break
 
             # Add model turn to history
-            contents.append(types.Content(role="model", parts=parts))
+            contents.append(candidate.content)
 
             # Execute all function calls and collect results
             fn_result_parts = []
@@ -399,6 +353,7 @@ class AgentService:
                 fn_result_parts.append(
                     types.Part(
                         function_response=types.FunctionResponse(
+                            id=part.function_call.id,
                             name=fn_name,
                             response=result
                         )

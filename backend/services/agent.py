@@ -1,6 +1,8 @@
 """DeadlineZero task planner using Gemini function calling."""
 
 import asyncio
+import json
+import httpx
 import uuid
 import os
 import urllib.parse
@@ -9,7 +11,7 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
 
 from models.task import (
     AgentRequest, AgentResponse, Task, Subtask,
@@ -138,12 +140,13 @@ def _degraded_response(request: AgentRequest, reason: str) -> AgentResponse:
 class AgentService:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
+        self.hf_token = os.getenv("HF_TOKEN", "").strip()
+        if not api_key and not self.hf_token:
             raise ValueError("GEMINI_API_KEY not set in environment")
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key) if api_key else None
         self.tool = _build_tool()
         self.model = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
-        print("[OK] Gemini agent ready (google-genai SDK)")
+        print("[OK] Hugging Face fallback configured" if self.hf_token else "[INFO] Hugging Face fallback not configured", flush=True)
 
     def _tasks_context(self, tasks: list[Task]) -> str:
         if not tasks:
@@ -274,17 +277,40 @@ class AgentService:
                     contents=contents,
                     config=config,
                 )
-            except ClientError as e:
-                status = getattr(e, "status_code", None) or getattr(e, "code", None)
-                msg = str(e)
-
-                # 429 = quota/rate limit — brief backoff then retry once
-                if status == 429 or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    if attempt == 0:
-                        print(f"[WARN] Model {model} rate-limited (429), backing off {RATE_LIMIT_BACKOFF}s...")
-                        await asyncio.sleep(RATE_LIMIT_BACKOFF)
-                        continue
+            except (ClientError, ServerError) as e:
+                if attempt == 0 and e.code in (429, 503):
+                    print(f"[WARN] Gemini returned {e.code}; retrying once")
+                    await asyncio.sleep(RATE_LIMIT_BACKOFF)
+                    continue
                 raise
+
+    async def _hugging_face(self, request: AgentRequest) -> AgentResponse:
+        response = AgentResponse(message="")
+        messages = [
+            {"role": "system", "content": _build_system_prompt(_now())},
+            {"role": "user", "content": self._tasks_context(request.tasks) + "\n" + request.message},
+        ]
+        async with httpx.AsyncClient(timeout=25) as client:
+            for _ in range(6):
+                result = await client.post(
+                    "https://router.huggingface.co/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {self.hf_token}"},
+                    json={"model": "openai/gpt-oss-120b", "messages": messages,
+                          "tools": [{"type": "function", "function": tool} for tool in AGENT_TOOLS]},
+                )
+                result.raise_for_status()
+                message = result.json()["choices"][0]["message"]
+                calls = message.get("tool_calls") or []
+                if not calls:
+                    response.message = message.get("content") or "The model returned no answer."
+                    return response
+                messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls})
+                for call in calls:
+                    fn = call["function"]
+                    data = self._handle_tool_call(fn["name"], json.loads(fn["arguments"]), request.tasks, response)
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(data)})
+        response.message = "Planning stopped at the tool-call limit."
+        return response
 
     async def run(self, request: AgentRequest) -> AgentResponse:
         response = AgentResponse(message="")
@@ -306,17 +332,26 @@ class AgentService:
             temperature=0.3,
         )
 
-        for _ in range(6):
+        for turn in range(6):
             try:
+                if self.client is None:
+                    raise RuntimeError("Gemini is not configured")
                 gemini_resp = await self._call_model(self.model, contents, config)
             except Exception as error:
                 code = getattr(error, "code", None)
                 print(f"[WARN] Gemini model {self.model}: {type(error).__name__} ({code})")
                 reason = {
+                    503: "Gemini is temporarily unavailable. Please try again shortly.",
                     404: "The configured Gemini model is unavailable for this project.",
                     429: "Gemini has reached its request or quota limit.",
                     403: "Gemini denied this project's request.",
                 }.get(code, "The planning assistant could not reach Gemini or complete the request.")
+                if self.hf_token and turn == 0:
+                    try:
+                        return await self._hugging_face(request)
+                    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as fallback_error:
+                        print(f"[WARN] Hugging Face fallback failed: {type(fallback_error).__name__}")
+                        reason = "Both planning providers are unavailable. Use /plan or /add in chat."
                 return _degraded_response(request, reason)
 
             if not gemini_resp.candidates:
